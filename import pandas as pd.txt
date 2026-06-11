@@ -1,0 +1,237 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics import silhouette_score, silhouette_samples
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+class EduProSegmentation:
+    def __init__(self, users_path, courses_path, transactions_path):
+        """Initialize with data paths"""
+        self.users_df = pd.read_csv(users_path)
+        self.courses_df = pd.read_csv(courses_path)
+        self.transactions_df = pd.read_csv(transactions_path)
+        self.learner_profiles = None
+        self.clusters = None
+        
+    def create_learner_profiles(self):
+        """Aggregate transaction data and create learner profiles"""
+        # Merge transactions with course data
+        merged_df = self.transactions_df.merge(
+            self.courses_df, on='CourseID', how='left'
+        )
+        
+        # Merge with user demographics
+        merged_df = merged_df.merge(
+            self.users_df, on='UserID', how='left'
+        )
+        
+        # Aggregate learner-level features
+        learner_agg = merged_df.groupby('UserID').agg({
+            'CourseID': 'nunique',  # Total courses enrolled
+            'Amount': ['sum', 'mean'],  # Total and average spending
+            'Age': 'first',
+            'Gender': 'first'
+        }).reset_index()
+        
+        learner_agg.columns = ['UserID', 'TotalCoursesEnrolled', 'TotalSpending', 
+                               'AvgSpending', 'Age', 'Gender']
+        
+        # Calculate engagement features
+        engagement_features = self._calculate_engagement_features(merged_df)
+        preference_features = self._calculate_preference_features(merged_df)
+        behavioral_features = self._calculate_behavioral_features(merged_df)
+        
+        # Merge all features
+        self.learner_profiles = learner_agg.copy()
+        self.learner_profiles = self.learner_profiles.merge(
+            engagement_features, on='UserID', how='left'
+        )
+        self.learner_profiles = self.learner_profiles.merge(
+            preference_features, on='UserID', how='left'
+        )
+        self.learner_profiles = self.learner_profiles.merge(
+            behavioral_features, on='UserID', how='left'
+        )
+        
+        return self.learner_profiles
+    
+    def _calculate_engagement_features(self, df):
+        """Calculate engagement features"""
+        engagement = df.groupby('UserID').agg({
+            'CourseCategory': lambda x: (x.value_counts() / len(x)).mean(),  # Avg courses per category
+            'TransactionDate': 'count'  # Enrollment frequency
+        }).reset_index()
+        
+        engagement.columns = ['UserID', 'AvgCoursesPerCategory', 'EnrollmentFrequency']
+        return engagement
+    
+    def _calculate_preference_features(self, df):
+        """Calculate preference features"""
+        preference = df.groupby('UserID').agg({
+            'CourseCategory': lambda x: x.mode()[0] if len(x.mode()) > 0 else 'Unknown',
+            'CourseLevel': lambda x: x.mode()[0] if len(x.mode()) > 0 else 'Unknown',
+            'CourseRating': 'mean'
+        }).reset_index()
+        
+        preference.columns = ['UserID', 'PreferredCategory', 'PreferredLevel', 'AvgCourseRating']
+        return preference
+    
+    def _calculate_behavioral_features(self, df):
+        """Calculate behavioral features"""
+        # Diversity score (number of unique categories)
+        diversity = df.groupby('UserID')['CourseCategory'].nunique().reset_index()
+        diversity.columns = ['UserID', 'DiversityScore']
+        
+        # Learning depth index (beginner vs advanced ratio)
+        course_level_dist = df.groupby('UserID')['CourseLevel'].value_counts().unstack(fill_value=0)
+        
+        behavioral = diversity.copy()
+        behavioral['LearningDepthIndex'] = course_level_dist.get('Beginner', 0) / (
+            course_level_dist.get('Beginner', 0) + course_level_dist.get('Advanced', 1)
+        )
+        
+        return behavioral
+    
+    def preprocess_features(self):
+        """Normalize and encode features"""
+        # Handle categorical variables
+        self.learner_profiles['Gender_encoded'] = pd.factorize(self.learner_profiles['Gender'])[0]
+        
+        # Select numerical features for clustering
+        numerical_features = [
+            'TotalCoursesEnrolled', 'TotalSpending', 'AvgSpending', 'Age',
+            'AvgCoursesPerCategory', 'EnrollmentFrequency', 'AvgCourseRating',
+            'DiversityScore', 'LearningDepthIndex'
+        ]
+        
+        # Handle missing values
+        self.learner_profiles[numerical_features] = self.learner_profiles[numerical_features].fillna(0)
+        
+        # Normalize features
+        scaler = StandardScaler()
+        features_normalized = scaler.fit_transform(self.learner_profiles[numerical_features])
+        
+        return features_normalized, numerical_features
+    
+    def determine_optimal_clusters(self, features, max_clusters=10):
+        """Determine optimal number of clusters using Elbow and Silhouette methods"""
+        inertias = []
+        silhouette_scores = []
+        K_range = range(2, max_clusters + 1)
+        
+        for k in K_range:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(features)
+            inertias.append(kmeans.inertia_)
+            silhouette_scores.append(silhouette_score(features, labels))
+        
+        # Plot Elbow and Silhouette curves
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        axes[0].plot(K_range, inertias, 'bo-')
+        axes[0].set_xlabel('Number of Clusters (k)')
+        axes[0].set_ylabel('Inertia')
+        axes[0].set_title('Elbow Method')
+        axes[0].grid(True)
+        
+        axes[1].plot(K_range, silhouette_scores, 'ro-')
+        axes[1].set_xlabel('Number of Clusters (k)')
+        axes[1].set_ylabel('Silhouette Score')
+        axes[1].set_title('Silhouette Method')
+        axes[1].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('optimal_clusters.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        optimal_k = K_range[np.argmax(silhouette_scores)]
+        return optimal_k, silhouette_scores
+    
+    def segment_learners(self, features, n_clusters=4):
+        """Apply K-Means and Hierarchical Clustering"""
+        # K-Means Clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        kmeans_labels = kmeans.fit_predict(features)
+        
+        # Hierarchical Clustering
+        hierarchical = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
+        hierarchical_labels = hierarchical.fit_predict(features)
+        
+        # Store results
+        self.learner_profiles['KMeans_Cluster'] = kmeans_labels
+        self.learner_profiles['Hierarchical_Cluster'] = hierarchical_labels
+        self.clusters = kmeans_labels
+        
+        return kmeans_labels, hierarchical_labels
+    
+    def evaluate_clustering(self, features, labels):
+        """Evaluate clustering quality"""
+        silhouette_avg = silhouette_score(features, labels)
+        silhouette_vals = silhouette_samples(features, labels)
+        
+        print(f"Silhouette Score: {silhouette_avg:.3f}")
+        print(f"Silhouette Values Range: [{silhouette_vals.min():.3f}, {silhouette_vals.max():.3f}]")
+        
+        return silhouette_avg, silhouette_vals
+    
+    def generate_recommendations(self):
+        """Generate personalized course recommendations for each segment"""
+        recommendations = {}
+        
+        for cluster_id in self.learner_profiles['KMeans_Cluster'].unique():
+            cluster_learners = self.learner_profiles[
+                self.learner_profiles['KMeans_Cluster'] == cluster_id
+            ]
+            
+            # Analyze cluster characteristics
+            avg_age = cluster_learners['Age'].mean()
+            preferred_category = cluster_learners['PreferredCategory'].mode()[0]
+            avg_rating = cluster_learners['AvgCourseRating'].mean()
+            
+            recommendations[f'Cluster_{cluster_id}'] = {
+                'size': len(cluster_learners),
+                'avg_age': avg_age,
+                'preferred_category': preferred_category,
+                'avg_rating': avg_rating,
+                'recommendation': f"Recommend advanced courses in {preferred_category} with ratings > {avg_rating:.1f}"
+            }
+        
+        return recommendations
+
+# Example usage
+if __name__ == "__main__":
+    segmentation = EduProSegmentation(
+        'users.csv',
+        'courses.csv',
+        'transactions.csv'
+    )
+    
+    # Create learner profiles
+    profiles = segmentation.create_learner_profiles()
+    print("Learner Profiles Created:")
+    print(profiles.head())
+    
+    # Preprocess features
+    features, feature_names = segmentation.preprocess_features()
+    
+    # Determine optimal clusters
+    optimal_k, silhouette_scores = segmentation.determine_optimal_clusters(features)
+    print(f"\nOptimal number of clusters: {optimal_k}")
+    
+    # Segment learners
+    kmeans_labels, hierarchical_labels = segmentation.segment_learners(features, n_clusters=optimal_k)
+    
+    # Evaluate clustering
+    silhouette_avg, silhouette_vals = segmentation.evaluate_clustering(features, kmeans_labels)
+    
+    # Generate recommendations
+    recommendations = segmentation.generate_recommendations()
+    for cluster, rec in recommendations.items():
+        print(f"\n{cluster}: {rec}")
+    
+    # Save results
+    segmentation.learner_profiles.to_csv('learner_segments.csv', index=False)
